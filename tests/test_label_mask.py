@@ -18,7 +18,10 @@ Checks, on a synthetic one-factor corpus with a regression and a binary label:
     (iii) `labels_in_encoder=True` with a missing label raises;
     (iv)  the Corpus keeps `M_labels` byte-identical without NaN and fills the
           placeholder with NaN present (class 0 for multiclass, `num_classes`
-          from the observed values).
+          from the observed values);
+    (v)   per-head covariates: a head with `use_covariates: False` has
+          `in_features == n_factors` and ignores `M_prediction`; the default
+          (True) keeps `n_factors + covariate_size` and the old forward.
 
 Plain script (no pytest in the project env):
     PYTHONPATH=. python tests/test_label_mask.py
@@ -234,10 +237,56 @@ def test_corpus_labels_and_mask():
     assert corpus2.M_labels_mask.sum() == 3 * 64 - 5
 
 
+def test_per_head_covariates():
+    """(v) `use_covariates: False` -> the head reads z alone, with or without M."""
+    from deeplatent.predictors import MultiLabelPredictor
+
+    torch.manual_seed(0)
+    info = {"y": {"type": "regression", "num_classes": None, "start_idx": 0,
+                  "end_idx": 1, "column": "y"},
+            "b": {"type": "binary", "num_classes": None, "start_idx": 1,
+                  "end_idx": 2, "column": "b"}}
+    cfg = {"y": {**LINEAR, "bias": False}, "b": {**LINEAR, "use_covariates": False}}
+    pred = MultiLabelPredictor(n_factors=1, covariate_size=3, labels_info=info,
+                               predictor_configs=cfg)
+    assert pred.predictors["y"].neural_net["pred_0"].in_features == 4   # default: z + M
+    assert pred.predictors["b"].neural_net["pred_0"].in_features == 1   # z alone
+    x, M = torch.randn(5, 1), torch.randn(5, 3)
+    out = pred(x, M)
+    wy = pred.predictors["y"].neural_net["pred_0"].weight
+    assert torch.allclose(out["y"], torch.cat([x, M], 1) @ wy.T)
+    lb = pred.predictors["b"].neural_net["pred_0"]
+    assert torch.allclose(out["b"], x @ lb.weight.T + lb.bias)
+    assert torch.allclose(out["b"], pred.predictors["b"](x, None))  # M irrelevant here
+    # Through the model: a Corpus with prediction covariates and both heads.
+    df, xm = synthetic()
+    df["g"] = (np.arange(len(df)) % 3).astype(str)
+    corpus = Corpus(
+        df, prediction="~ C(g)", labels=LABELS,
+        modalities={"doc": {"views": {"embedding": {"type": "embedding",
+                                                    "matrix": xm}}}},
+    )
+    model = IdealPointNN(
+        corpus, n_ideal_points=1, ae_type="vae", vi_type="mean_field",
+        update_prior=False, encoder_args={"doc_embedding": dict(LINEAR)},
+        decoder_args={"doc_embedding": dict(LINEAR)},
+        predictor_args={"y": {**LINEAR, "bias": False},
+                        "b": {**LINEAR, "use_covariates": False}},
+        num_steps=0, batch_size=32, num_workers=0, print_every_n_steps=10**9,
+        ckpt_folder=tempfile.mkdtemp(), return_best_model=False, device="cpu", seed=0,
+    )
+    k = corpus.M_prediction.shape[1]
+    assert model.predictor.predictors["y"].neural_net["pred_0"].in_features == 1 + k
+    assert model.predictor.predictors["b"].neural_net["pred_0"].in_features == 1
+    got = one_batch(corpus, model)
+    assert math.isfinite(got["loss"]) and got["n_obs"] == {"y": 32, "b": 32}
+
+
 if __name__ == "__main__":
     for fn in (test_corpus_labels_and_mask,
                test_labels_in_encoder_with_missing_labels_raises,
                test_no_nan_reproduces_the_package_before_the_mask,
-               test_masked_loss_splits_over_observed_documents):
+               test_masked_loss_splits_over_observed_documents,
+               test_per_head_covariates):
         fn()
         print(f"ok  {fn.__name__}")

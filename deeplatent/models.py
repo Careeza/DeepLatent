@@ -486,7 +486,8 @@ class DeepLatent:
         # PREDICTOR (multi-label)
         if self.labels_info:
             self.predictor = MultiLabelPredictor(
-                input_dim=n_factors + self.prediction_covariate_size,
+                n_factors=n_factors,
+                covariate_size=self.prediction_covariate_size,
                 labels_info=self.labels_info,
                 predictor_configs=predictor_args,
             ).to(self.device)
@@ -3424,7 +3425,8 @@ class DeepLatent:
             if not hasattr(self, "predictor") or self.predictor is None:
                 # Create MultiLabelPredictor from loaded labels_info and predictor_args
                 self.predictor = MultiLabelPredictor(
-                    input_dim=self.n_factors + self.prediction_covariate_size,
+                    n_factors=self.n_factors,
+                    covariate_size=self.prediction_covariate_size,
                     labels_info=self.labels_info,
                     predictor_configs=self.predictor_args,
                 ).to(self.device)

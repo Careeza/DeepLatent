@@ -89,7 +89,8 @@ class MultiLabelPredictor(nn.Module):
 
     def __init__(
         self,
-        input_dim: int,
+        n_factors: int,
+        covariate_size: int,
         labels_info: Dict[str, Dict],
         predictor_configs: Dict[str, Dict],
     ):
@@ -97,7 +98,11 @@ class MultiLabelPredictor(nn.Module):
         Initialize the MultiLabelPredictor.
 
         Args:
-            input_dim: Dimension of input features (n_factors + prediction_covariate_size)
+            n_factors: Dimension of the latent input (theta or z) every head reads.
+            covariate_size: Dimension of the prediction covariates (M_prediction),
+                appended to the input of the heads whose config has
+                use_covariates=True (the default). A head with use_covariates=False
+                reads the latent alone even when M_prediction is given.
             labels_info: Dict mapping label names to their metadata:
                 {
                     "label_name": {
@@ -113,7 +118,8 @@ class MultiLabelPredictor(nn.Module):
                     "label_name": {
                         "hidden_dims": [64, 32],
                         "dropout": 0.1,
-                        "loss_weight": 1.0
+                        "loss_weight": 1.0,
+                        "use_covariates": True
                     }
                 }
         """
@@ -122,6 +128,10 @@ class MultiLabelPredictor(nn.Module):
         self.labels_info = labels_info
         self.predictor_configs = predictor_configs
         self.predictors = nn.ModuleDict()
+        self.use_covariates = {
+            name: bool(predictor_configs.get(name, {}).get("use_covariates", True))
+            for name in labels_info
+        }
 
         # Learned observation-noise variance (as log sigma^2) per regression label. This makes
         # the regression term in the ELBO a proper Gaussian log-likelihood log p(y | theta)
@@ -152,6 +162,9 @@ class MultiLabelPredictor(nn.Module):
                 raise ValueError(f"Unknown label type: {label_type}")
 
             # Build predictor dims: input -> hidden layers -> output
+            input_dim = n_factors + (
+                covariate_size if self.use_covariates[label_name] else 0
+            )
             predictor_dims = [input_dim] + hidden_dims + [output_dim]
 
             # Create MLP for this label
@@ -173,6 +186,7 @@ class MultiLabelPredictor(nn.Module):
         Args:
             x: Input tensor of shape (batch_size, n_factors)
             M_prediction: Optional prediction covariates of shape (batch_size, prediction_covariate_size)
+                (passed to the heads with use_covariates=True only)
 
         Returns:
             Dict mapping label names to prediction tensors.
@@ -182,5 +196,7 @@ class MultiLabelPredictor(nn.Module):
         """
         predictions = {}
         for label_name, predictor in self.predictors.items():
-            predictions[label_name] = predictor(x, M_prediction)
+            predictions[label_name] = predictor(
+                x, M_prediction if self.use_covariates[label_name] else None
+            )
         return predictions
