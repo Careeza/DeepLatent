@@ -19,6 +19,7 @@ from umap import UMAP
 from .autoencoders import (
     EncoderMLP,
     DecoderMLP,
+    GaussianDecoderMLP,
     MultiModalEncoder,
     ImageEncoder,
     ImageDecoder,
@@ -402,12 +403,18 @@ class DeepLatent:
                     + config.get("hidden_dims", [])
                     + [output_dim]
                 )
-                self.decoders[key] = DecoderMLP(
+                decoder_kwargs = dict(
                     decoder_dims=dims,
                     decoder_non_linear_activation=config.get("activation", None),
                     decoder_bias=config.get("bias", False),
                     dropout=config.get("dropout", 0.0),
-                ).to(self.device)
+                )
+                if view_type == "embedding" and "noise_var" in config:
+                    self.decoders[key] = GaussianDecoderMLP(
+                        noise_var=config["noise_var"], **decoder_kwargs
+                    ).to(self.device)
+                else:
+                    self.decoders[key] = DecoderMLP(**decoder_kwargs).to(self.device)
 
         # PRIOR
         if self.ae_type == "ae":
@@ -988,7 +995,21 @@ class DeepLatent:
 
                     elif view_type == "embedding":
                         # Per-document Gaussian NLL: summed over feature dims, averaged over batch.
-                        if mog_component_weights is not None:
+                        if hasattr(decoder, "gaussian_nll"):
+                            # Explicit sigma^2 (GaussianDecoderMLP), constant included.
+                            if mog_component_weights is not None:
+                                component_nll = decoder.gaussian_nll(
+                                    recon.reshape(B_mog, C_mog, -1), target.unsqueeze(1)
+                                )
+                                recon_loss = (
+                                    mog_component_weights * component_nll
+                                ).sum() / B_mog
+                            else:
+                                recon_loss = (
+                                    decoder.gaussian_nll(recon, target).sum()
+                                    / target.shape[0]
+                                )
+                        elif mog_component_weights is not None:
                             component_nll = (
                                 (recon.reshape(B_mog, C_mog, -1) - target.unsqueeze(1))
                                 .pow(2)
@@ -2935,7 +2956,10 @@ class DeepLatent:
                 if vt == "bow":
                     ll = (target * F.log_softmax(recon, dim=1)).sum(1)
                 elif vt == "embedding":
-                    ll = -((recon - target) ** 2).sum(1)
+                    if hasattr(decoder, "gaussian_nll"):
+                        ll = -decoder.gaussian_nll(recon, target)
+                    else:
+                        ll = -((recon - target) ** 2).sum(1)
                 elif vt == "vote":
                     mask = ~md["mask"].to(self.device)
                     bce = F.binary_cross_entropy_with_logits(

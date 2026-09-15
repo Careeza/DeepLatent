@@ -491,6 +491,47 @@ class DecoderMLP(nn.Module):
         return hid
 
 
+class GaussianDecoderMLP(DecoderMLP):
+    """
+    DecoderMLP for a Gaussian (embedding) view with an explicit noise variance sigma^2.
+
+    Attributes:
+        noise_log_var (torch.Tensor): log sigma^2, isotropic across features. A learned
+            parameter initialised at sigma^2 = 1 when noise_var="learn", a fixed buffer
+            when noise_var is a positive float.
+    """
+
+    def __init__(self, *args, noise_var: Union[str, float] = "learn", **kwargs):
+        super(GaussianDecoderMLP, self).__init__(*args, **kwargs)
+        if noise_var == "learn":
+            self.noise_log_var = nn.Parameter(torch.zeros(()))
+        else:
+            noise_var = float(noise_var)
+            if not noise_var > 0:
+                raise ValueError(
+                    f"noise_var must be 'learn' or a positive float, got {noise_var!r}"
+                )
+            self.register_buffer("noise_log_var", torch.tensor(math.log(noise_var)))
+
+    def gaussian_nll(self, recon: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Per-document Gaussian NLL -log N(target; recon, sigma^2 I) over features.
+
+        Args:
+            recon (torch.Tensor): Decoder output.
+            target (torch.Tensor): Observed embeddings, broadcastable to recon.
+
+        Returns:
+            torch.Tensor: NLL per document, shape recon.shape[:-1].
+        """
+        log_var = self.noise_log_var.clamp(-12.0, 4.0)
+        sq_err = (recon - target).pow(2).sum(-1)
+        d = recon.shape[-1]
+        return 0.5 * (
+            torch.exp(-log_var) * sq_err + d * (log_var + math.log(2 * math.pi))
+        )
+
+
 class MaskedLinear(nn.Module):
     """A linear layer with a mask to ensure autoregressive property."""
 
