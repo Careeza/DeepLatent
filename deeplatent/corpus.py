@@ -133,8 +133,8 @@ class Corpus(Dataset):
         self.prediction_colnames, self.M_prediction = (
             self._transform_df(prediction) if prediction else ([], None)
         )
-        self.labels_info, self.M_labels = (
-            self._process_labels(labels) if labels else ({}, None)
+        self.labels_info, self.M_labels, self.M_labels_mask = (
+            self._process_labels(labels) if labels else ({}, None, None)
         )
 
         self.id2token = {}
@@ -162,12 +162,19 @@ class Corpus(Dataset):
                     "is_spam": {"column": "spam_flag", "type": "binary"}
                 }
 
+        A NaN in a label column marks a document whose label is not observed: it
+        gets 0 in M_labels (class index 0 for multiclass) and 0 in M_labels_mask,
+        and the model drops it from that label's loss. Without NaN the mask is all
+        ones and M_labels is what it was.
+
         Returns:
             labels_info: Dict with metadata per label (type, num_classes, start_idx, end_idx, column)
             M_labels: np.ndarray with all label values concatenated
+            M_labels_mask: np.ndarray, float32, same shape, 1.0 where observed
         """
         labels_info = {}
         label_arrays = []
+        mask_arrays = []
         current_idx = 0
 
         for label_name, config in labels_config.items():
@@ -179,6 +186,9 @@ class Corpus(Dataset):
                                f"Must be 'regression', 'binary', or 'multiclass'.")
 
             values = self.df[column].values
+            observed = ~pd.isna(values)
+            # Unobserved documents carry a placeholder (0) and a 0 in the mask.
+            values = np.where(observed, values, 0)
 
             if label_type == "regression":
                 # Continuous values
@@ -194,7 +204,7 @@ class Corpus(Dataset):
                 # Integer class indices
                 num_classes = config.get("num_classes")
                 if num_classes is None:
-                    num_classes = int(values.max()) + 1
+                    num_classes = int(values[observed].max()) + 1
                 arr = values.astype(np.int64).reshape(-1, 1)
                 end_idx = current_idx + 1
 
@@ -207,14 +217,17 @@ class Corpus(Dataset):
             }
 
             label_arrays.append(arr)
+            mask_arrays.append(observed.astype(np.float32).reshape(-1, 1))
             current_idx = end_idx
 
         if label_arrays:
             M_labels = np.concatenate(label_arrays, axis=1).astype(np.float32)
+            M_labels_mask = np.concatenate(mask_arrays, axis=1).astype(np.float32)
         else:
             M_labels = None
+            M_labels_mask = None
 
-        return labels_info, M_labels
+        return labels_info, M_labels, M_labels_mask
 
     def __len__(self):
         return len(self.df)
@@ -270,5 +283,6 @@ class Corpus(Dataset):
             d["M_prediction"] = self.M_prediction[i]
         if self.labels_info:
             d["M_labels"] = self.M_labels[i]
+            d["M_labels_mask"] = self.M_labels_mask[i]
 
         return d

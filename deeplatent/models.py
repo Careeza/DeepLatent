@@ -232,6 +232,15 @@ class DeepLatent:
             else 0
         )
         self.labels_in_encoder = bool(labels_in_encoder and self.label_size > 0)
+        if self.labels_in_encoder:
+            label_mask = getattr(train_data, "M_labels_mask", None)
+            if label_mask is not None and not np.all(label_mask == 1):
+                raise ValueError(
+                    "labels_in_encoder=True needs every label observed: the encoder "
+                    "would read the placeholder of the unobserved labels (NaN in a "
+                    "label column). Drop those documents or set "
+                    "labels_in_encoder=False."
+                )
 
         self.content_colnames = train_data.content_colnames or []
         self.prevalence_colnames = train_data.prevalence_colnames or []
@@ -794,6 +803,7 @@ class DeepLatent:
             content_covariates = data.get("M_content_covariates", None)
             prediction_covariates = data.get("M_prediction", None)
             target_labels = data.get("M_labels", None)
+            label_mask = data.get("M_labels_mask", None)
 
             # -------------------- ENCODER INPUT --------------------
             modality_inputs = {}
@@ -1431,14 +1441,26 @@ class DeepLatent:
                     predictions = self.predictor(doc_latents, prediction_covariates)
                 prediction_loss = 0.0
                 self.per_label_losses = {}
+                self.per_label_n_obs = {}
 
                 for label_name, label_info in self.labels_info.items():
                     pred = predictions[label_name]
                     label_type = label_info["type"]
                     start_idx = label_info["start_idx"]
 
-                    # Extract target for this label
+                    # Extract target for this label. A document whose label is not
+                    # observed (NaN in the column -> 0 in M_labels_mask) leaves the
+                    # loss: each branch below is a per-document NLL, summed over the
+                    # observed documents and divided by the batch size like the
+                    # reconstruction term, i.e. the ELBO with the missing labels
+                    # marginalised out. Without missing labels the mask is all ones
+                    # and the loss is the batch mean it was.
                     target = target_labels[:, start_idx]
+                    n_docs = target.shape[0]
+                    if label_mask is not None:
+                        mask = label_mask[:, start_idx]
+                    else:
+                        mask = torch.ones_like(target)
 
                     # Compute loss based on label type
                     if label_type == "regression":
@@ -1453,11 +1475,11 @@ class DeepLatent:
                             sq_err = (
                                 pred.reshape(B_mog, C_mog) - target.unsqueeze(1)
                             ).pow(2)
-                            mean_sq_err = (mog_component_weights * sq_err).sum() / B_mog
+                            doc_sq_err = (mog_component_weights * sq_err).sum(dim=1)
                         else:
-                            mean_sq_err = (pred.squeeze() - target).pow(2).mean()
-                        label_loss = 0.5 * (
-                            torch.exp(-log_var) * mean_sq_err
+                            doc_sq_err = (pred.squeeze() - target).pow(2)
+                        doc_nll = 0.5 * (
+                            torch.exp(-log_var) * doc_sq_err
                             + log_var
                             + np.log(2 * np.pi)
                         )
@@ -1468,12 +1490,10 @@ class DeepLatent:
                                 target.unsqueeze(1).expand(-1, C_mog),
                                 reduction="none",
                             )
-                            label_loss = (
-                                mog_component_weights * component_nll
-                            ).sum() / B_mog
+                            doc_nll = (mog_component_weights * component_nll).sum(dim=1)
                         else:
-                            label_loss = F.binary_cross_entropy_with_logits(
-                                pred.squeeze(), target
+                            doc_nll = F.binary_cross_entropy_with_logits(
+                                pred.squeeze(), target, reduction="none"
                             )
                     elif label_type == "multiclass":
                         if mog_component_weights is not None:
@@ -1486,13 +1506,15 @@ class DeepLatent:
                             component_nll = F.cross_entropy(
                                 pred, target_expanded, reduction="none"
                             ).reshape(B_mog, C_mog)
-                            label_loss = (
-                                mog_component_weights * component_nll
-                            ).sum() / B_mog
+                            doc_nll = (mog_component_weights * component_nll).sum(dim=1)
                         else:
-                            label_loss = F.cross_entropy(pred, target.long())
+                            doc_nll = F.cross_entropy(
+                                pred, target.long(), reduction="none"
+                            )
                     else:
                         raise ValueError(f"Unknown label type: {label_type}")
+
+                    label_loss = (doc_nll * mask).sum() / n_docs
 
                     # Apply per-label loss weight
                     config = self.predictor_args.get(label_name, {})
@@ -1500,10 +1522,12 @@ class DeepLatent:
                     weighted_loss = label_loss * loss_weight
 
                     self.per_label_losses[label_name] = label_loss.item()
+                    self.per_label_n_obs[label_name] = int(mask.sum().item())
                     prediction_loss = prediction_loss + weighted_loss
             else:
                 prediction_loss = 0.0
                 self.per_label_losses = {}
+                self.per_label_n_obs = {}
 
             # -------------------- TOTAL LOSS --------------------
             loss = (
